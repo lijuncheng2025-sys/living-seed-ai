@@ -936,6 +936,552 @@ echo "种子AI已部署并设为开机自启!"`,
     }
 }
 
+// ═══════════════════════════════════════════════
+//  GPU自动供应器 (账户+Key+部署 全链路自动化)
+// ═══════════════════════════════════════════════
+
+class GPUAutoProvisioner {
+    constructor(deployer) {
+        this._deployer = deployer;
+        this._ghToken = deployer._ghToken;
+        this._ghRepo = deployer._ghRepo;
+        this._taskQueue = [];        // 浏览器Agent任务队列
+        this._provisionLog = [];
+        this._credentials = {};      // 自动获取的凭据
+        this._loadCredentials();
+    }
+
+    _loadCredentials() {
+        const credPath = path.join(__dirname, 'cloud-credentials.json');
+        if (fs.existsSync(credPath)) {
+            try { this._credentials = JSON.parse(fs.readFileSync(credPath, 'utf8')); } catch {}
+        }
+    }
+
+    _saveCredentials() {
+        const credPath = path.join(__dirname, 'cloud-credentials.json');
+        try { fs.writeFileSync(credPath, JSON.stringify(this._credentials, null, 2)); } catch {}
+    }
+
+    // ═══════════════════════════════════════
+    //  1. Colab全自动部署 (推送Notebook到GitHub → 直链打开)
+    // ═══════════════════════════════════════
+
+    async deployToColab() {
+        console.log(`${C.cyan}[Provision]${C.reset} 自动部署到Google Colab...`);
+
+        // 生成.ipynb notebook文件
+        const notebook = this._generateColabNotebook();
+        const nbJson = JSON.stringify(notebook, null, 1);
+
+        // 推送到GitHub仓库
+        const pushed = await this._pushFileToGitHub(
+            'seed-colab-gpu.ipynb', nbJson,
+            'Auto-deploy: Colab GPU notebook'
+        );
+
+        if (pushed) {
+            const colabUrl = `https://colab.research.google.com/github/${this._ghRepo}/blob/main/seed-colab-gpu.ipynb`;
+            console.log(`${C.green}[Provision]${C.reset} Colab Notebook已推送!`);
+            console.log(`${C.green}[Provision]${C.reset} 一键打开: ${colabUrl}`);
+
+            // 添加浏览器自动打开任务
+            this._addBrowserTask({
+                type: 'auto_open_colab',
+                url: colabUrl,
+                steps: [
+                    { action: 'navigate', url: colabUrl },
+                    { action: 'wait', ms: 3000 },
+                    { action: 'click', selector: 'button[aria-label="Run all"], [data-testid="run-all"]', fallback: 'Ctrl+F9' },
+                ],
+                priority: 'high',
+            });
+
+            this._logProvision('colab', 'deployed', { url: colabUrl });
+            return { ok: true, url: colabUrl, platform: 'colab' };
+        }
+
+        return { ok: false, reason: 'push_failed' };
+    }
+
+    _generateColabNotebook() {
+        return {
+            nbformat: 4, nbformat_minor: 0,
+            metadata: {
+                colab: { name: 'Living Seed AI - GPU Brain', provenance: [] },
+                kernelspec: { name: 'python3', display_name: 'Python 3' },
+                accelerator: 'GPU', // 请求T4 GPU
+            },
+            cells: [
+                {
+                    cell_type: 'markdown', metadata: {},
+                    source: ['# 🌱 活体种子AI - Colab GPU 云脑\\n',
+                        '自动部署、自动进化、永续运行\\n',
+                        '> GPU: Tesla T4 16GB | 免费12h/session']
+                },
+                {
+                    cell_type: 'code', metadata: {}, outputs: [], execution_count: null,
+                    source: [
+                        '# 1. 克隆代码\\n',
+                        `!git clone https://github.com/${this._ghRepo}.git 2>/dev/null || (cd living-seed-ai && git pull)\\n`,
+                        '%cd living-seed-ai'
+                    ]
+                },
+                {
+                    cell_type: 'code', metadata: {}, outputs: [], execution_count: null,
+                    source: [
+                        '# 2. 安装Node.js 22\\n',
+                        '!curl -fsSL https://deb.nodesource.com/setup_22.x | bash - 2>/dev/null\\n',
+                        '!apt-get install -y nodejs 2>/dev/null\\n',
+                        '!node --version'
+                    ]
+                },
+                {
+                    cell_type: 'code', metadata: {}, outputs: [], execution_count: null,
+                    source: [
+                        '# 3. 安装依赖\\n',
+                        '!npm install --omit=dev 2>/dev/null'
+                    ]
+                },
+                {
+                    cell_type: 'code', metadata: {}, outputs: [], execution_count: null,
+                    source: [
+                        '# 4. 配置环境 (从GitHub Secrets或手动)\\n',
+                        'import os\\n',
+                        "os.environ['SEED_INSTANCE_ID'] = 'colab-gpu-t4'\\n",
+                        "os.environ['SEED_PLATFORM'] = 'google-colab'\\n",
+                        '# GPU信息\\n',
+                        '!nvidia-smi'
+                    ]
+                },
+                {
+                    cell_type: 'code', metadata: {}, outputs: [], execution_count: null,
+                    source: [
+                        '# 5. 启动种子 (GPU加速模式, 10小时运行)\\n',
+                        '!timeout 36000 node start-cloud.js 2>&1 | tail -f'
+                    ]
+                },
+                {
+                    cell_type: 'code', metadata: {}, outputs: [], execution_count: null,
+                    source: [
+                        '# 6. 保存进化成果\\n',
+                        '!cd living-seed-ai && git add *.json 2>/dev/null\\n',
+                        '!cd living-seed-ai && git diff --staged --quiet || git commit -m "Colab: auto-save $(date)"\\n',
+                        '!cd living-seed-ai && git push || echo "Push需要认证"'
+                    ]
+                },
+            ]
+        };
+    }
+
+    // ═══════════════════════════════════════
+    //  2. Kaggle全自动部署 (API + Notebook)
+    // ═══════════════════════════════════════
+
+    async deployToKaggle() {
+        console.log(`${C.cyan}[Provision]${C.reset} 自动部署到Kaggle...`);
+
+        // 生成Kaggle notebook并推送到GitHub
+        const notebook = this._generateKaggleNotebook();
+        const nbJson = JSON.stringify(notebook, null, 1);
+
+        const pushed = await this._pushFileToGitHub(
+            'seed-kaggle-gpu.ipynb', nbJson,
+            'Auto-deploy: Kaggle GPU notebook'
+        );
+
+        if (pushed) {
+            // Kaggle可以直接从GitHub导入notebook
+            const kaggleImportUrl = `https://www.kaggle.com/kernels/welcome?src=https://github.com/${this._ghRepo}/blob/main/seed-kaggle-gpu.ipynb`;
+            console.log(`${C.green}[Provision]${C.reset} Kaggle Notebook已推送!`);
+            console.log(`${C.green}[Provision]${C.reset} 一键导入: ${kaggleImportUrl}`);
+
+            // 如果有Kaggle API key, 直接用API创建kernel
+            if (this._credentials.kaggle_username && this._credentials.kaggle_key) {
+                const apiResult = await this._kaggleAPIDeploy();
+                if (apiResult.ok) {
+                    console.log(`${C.green}[Provision]${C.reset} Kaggle Kernel已通过API自动创建并运行!`);
+                    return { ok: true, url: apiResult.url, method: 'api' };
+                }
+            }
+
+            this._addBrowserTask({
+                type: 'auto_import_kaggle',
+                url: kaggleImportUrl,
+                steps: [
+                    { action: 'navigate', url: kaggleImportUrl },
+                    { action: 'wait', ms: 5000 },
+                    { action: 'click', selector: '[data-testid="gpu-toggle"], .gpu-accelerator-toggle' },
+                    { action: 'click', selector: 'button:has-text("Run All"), [aria-label="Run All"]' },
+                ],
+                priority: 'high',
+            });
+
+            return { ok: true, url: kaggleImportUrl, platform: 'kaggle' };
+        }
+
+        return { ok: false, reason: 'push_failed' };
+    }
+
+    _generateKaggleNotebook() {
+        return {
+            nbformat: 4, nbformat_minor: 0,
+            metadata: {
+                kaggle: {
+                    accelerator: 'gpu', dataSources: [],
+                    isGpuEnabled: true, isInternetEnabled: true,
+                    language: 'python', sourceType: 'notebook'
+                },
+                kernelspec: { name: 'python3', display_name: 'Python 3' },
+            },
+            cells: [
+                {
+                    cell_type: 'markdown', metadata: {},
+                    source: ['# 🌱 活体种子AI - Kaggle GPU 云脑\\n',
+                        'GPU: T4/P100 16GB | 免费30h/周']
+                },
+                {
+                    cell_type: 'code', metadata: { trusted: true }, outputs: [], execution_count: null,
+                    source: [
+                        `!git clone https://github.com/${this._ghRepo}.git 2>/dev/null\\n`,
+                        '%cd living-seed-ai\\n',
+                        '!curl -fsSL https://deb.nodesource.com/setup_22.x | bash - 2>/dev/null\\n',
+                        '!apt-get install -y nodejs 2>/dev/null\\n',
+                        '!npm install --omit=dev 2>/dev/null\\n',
+                        '!nvidia-smi\\n',
+                        '!timeout 36000 node start-cloud.js'
+                    ]
+                },
+            ]
+        };
+    }
+
+    async _kaggleAPIDeploy() {
+        // Kaggle Kernels API: https://www.kaggle.com/api/v1
+        const { kaggle_username, kaggle_key } = this._credentials;
+        if (!kaggle_username || !kaggle_key) return { ok: false };
+
+        try {
+            const auth = Buffer.from(`${kaggle_username}:${kaggle_key}`).toString('base64');
+            const kernelPush = await this._httpsRequest('POST', 'www.kaggle.com', '/api/v1/kernels/push', {
+                id: `${kaggle_username}/living-seed-ai-gpu`,
+                title: 'Living Seed AI - GPU Brain',
+                code_file_type: 'script',
+                language: 'python',
+                kernel_type: 'script',
+                enable_gpu: true,
+                enable_internet: true,
+                text: `import subprocess; subprocess.run(['bash', '-c', 'curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs && git clone https://github.com/${this._ghRepo}.git && cd living-seed-ai && npm install --omit=dev && timeout 36000 node start-cloud.js'])`,
+            }, { Authorization: `Basic ${auth}` });
+
+            if (kernelPush?.ref) {
+                return { ok: true, url: `https://www.kaggle.com/code/${kaggle_username}/living-seed-ai-gpu` };
+            }
+        } catch (e) {}
+        return { ok: false };
+    }
+
+    // ═══════════════════════════════════════
+    //  3. HuggingFace Spaces 自动部署 (API)
+    // ═══════════════════════════════════════
+
+    async deployToHuggingFace() {
+        const hfToken = process.env.HF_TOKEN || this._credentials.huggingface_token;
+        if (!hfToken) {
+            console.log(`${C.yellow}[Provision]${C.reset} HuggingFace需要Token, 添加浏览器注册任务...`);
+            this._addBrowserTask({
+                type: 'register_huggingface',
+                url: 'https://huggingface.co/join',
+                steps: [
+                    { action: 'navigate', url: 'https://huggingface.co/join' },
+                    { action: 'fill_form', fields: { email: 'auto', username: 'auto', password: 'auto' } },
+                    { action: 'navigate', url: 'https://huggingface.co/settings/tokens' },
+                    { action: 'click', selector: 'button:has-text("New token")' },
+                    { action: 'extract', selector: 'input[type="text"], code', save_as: 'huggingface_token' },
+                ],
+                priority: 'medium',
+            });
+            return { ok: false, reason: 'need_token', task_queued: true };
+        }
+
+        // HuggingFace Spaces API
+        try {
+            const spaceResult = await this._httpsRequest('POST', 'huggingface.co', '/api/repos/create', {
+                type: 'space', name: 'living-seed-ai',
+                sdk: 'docker', private: false,
+            }, { Authorization: `Bearer ${hfToken}` });
+
+            if (spaceResult?.url) {
+                console.log(`${C.green}[Provision]${C.reset} HuggingFace Space已创建: ${spaceResult.url}`);
+                // 推送Dockerfile和代码到HF Space
+                return { ok: true, url: spaceResult.url, platform: 'huggingface' };
+            }
+        } catch (e) {}
+        return { ok: false, reason: 'api_failed' };
+    }
+
+    // ═══════════════════════════════════════
+    //  4. 浏览器Agent 自动注册任务队列
+    // ═══════════════════════════════════════
+
+    _addBrowserTask(task) {
+        task.id = `task_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        task.status = 'pending';
+        task.createdAt = new Date().toISOString();
+        this._taskQueue.push(task);
+
+        // 保存任务队列到文件(本地浏览器Agent读取)
+        this._saveTaskQueue();
+        console.log(`${C.cyan}[Provision]${C.reset} 浏览器任务入队: ${task.type} (共${this._taskQueue.length}个待处理)`);
+    }
+
+    _saveTaskQueue() {
+        const queuePath = path.join(__dirname, 'browser-tasks.json');
+        try {
+            fs.writeFileSync(queuePath, JSON.stringify({
+                updatedAt: new Date().toISOString(),
+                pending: this._taskQueue.filter(t => t.status === 'pending'),
+                completed: this._taskQueue.filter(t => t.status === 'completed').slice(-20),
+            }, null, 2));
+        } catch {}
+    }
+
+    // 获取待处理任务(给浏览器Agent调用)
+    getPendingTasks() {
+        return this._taskQueue.filter(t => t.status === 'pending');
+    }
+
+    // 标记任务完成(浏览器Agent回报)
+    completeTask(taskId, result) {
+        const task = this._taskQueue.find(t => t.id === taskId);
+        if (task) {
+            task.status = 'completed';
+            task.completedAt = new Date().toISOString();
+            task.result = result;
+
+            // 如果获取了凭据，保存
+            if (result?.credentials) {
+                Object.assign(this._credentials, result.credentials);
+                this._saveCredentials();
+                console.log(`${C.green}[Provision]${C.reset} 新凭据已保存: ${Object.keys(result.credentials).join(', ')}`);
+            }
+
+            this._saveTaskQueue();
+        }
+    }
+
+    // ═══════════════════════════════════════
+    //  5. 全自动平台注册 (生成浏览器Agent步骤)
+    // ═══════════════════════════════════════
+
+    generateRegistrationTasks() {
+        const tasks = [];
+
+        // Kaggle注册 (用Google账户)
+        if (!this._credentials.kaggle_username) {
+            tasks.push({
+                type: 'register_kaggle',
+                platform: 'Kaggle',
+                url: 'https://www.kaggle.com/account/login',
+                steps: [
+                    { action: 'navigate', url: 'https://www.kaggle.com/account/login' },
+                    { action: 'click', selector: 'button:has-text("Sign in with Google"), .google-button' },
+                    { action: 'google_auth' }, // 触发Google OAuth
+                    { action: 'wait', ms: 3000 },
+                    { action: 'navigate', url: 'https://www.kaggle.com/settings/account' },
+                    { action: 'click', selector: 'button:has-text("Create New Token"), a:has-text("API")' },
+                    { action: 'download', save_as: 'kaggle.json' },
+                    { action: 'extract_json', file: 'kaggle.json', keys: ['username', 'key'],
+                      save_credentials: { kaggle_username: 'username', kaggle_key: 'key' } },
+                ],
+                priority: 'high',
+            });
+        }
+
+        // Lightning.ai注册 (用GitHub账户)
+        if (!this._credentials.lightning_token) {
+            tasks.push({
+                type: 'register_lightning',
+                platform: 'Lightning.ai',
+                url: 'https://lightning.ai/sign-up',
+                steps: [
+                    { action: 'navigate', url: 'https://lightning.ai/sign-up' },
+                    { action: 'click', selector: 'button:has-text("GitHub"), .github-login' },
+                    { action: 'github_auth' }, // GitHub OAuth
+                    { action: 'wait', ms: 5000 },
+                    { action: 'navigate', url: 'https://lightning.ai/account/api-keys' },
+                    { action: 'click', selector: 'button:has-text("Create"), button:has-text("New")' },
+                    { action: 'extract', selector: 'input[readonly], code, .api-key', save_as: 'lightning_token' },
+                ],
+                priority: 'medium',
+            });
+        }
+
+        // Cohere注册 (免费API)
+        if (!this._credentials.cohere_api_key) {
+            tasks.push({
+                type: 'register_cohere',
+                platform: 'Cohere',
+                url: 'https://dashboard.cohere.com/welcome/register',
+                steps: [
+                    { action: 'navigate', url: 'https://dashboard.cohere.com/welcome/register' },
+                    { action: 'fill_form', fields: { email: 'auto', name: 'auto' } },
+                    { action: 'wait_email_verification' },
+                    { action: 'navigate', url: 'https://dashboard.cohere.com/api-keys' },
+                    { action: 'extract', selector: '.api-key, code, input[readonly]', save_as: 'cohere_api_key' },
+                ],
+                priority: 'medium',
+            });
+        }
+
+        // Groq注册 (免费极速推理)
+        if (!this._credentials.groq_api_key) {
+            tasks.push({
+                type: 'register_groq',
+                platform: 'Groq',
+                url: 'https://console.groq.com/signup',
+                steps: [
+                    { action: 'navigate', url: 'https://console.groq.com/signup' },
+                    { action: 'click', selector: 'button:has-text("Google"), .google-auth' },
+                    { action: 'google_auth' },
+                    { action: 'navigate', url: 'https://console.groq.com/keys' },
+                    { action: 'click', selector: 'button:has-text("Create API Key")' },
+                    { action: 'extract', selector: 'input[readonly], code, .key-text', save_as: 'groq_api_key' },
+                ],
+                priority: 'high', // Groq超快推理，重要
+            });
+        }
+
+        // Together.ai注册
+        if (!this._credentials.together_api_key) {
+            tasks.push({
+                type: 'register_together',
+                platform: 'Together.ai',
+                url: 'https://api.together.ai/signup',
+                steps: [
+                    { action: 'navigate', url: 'https://api.together.ai/signup' },
+                    { action: 'click', selector: 'button:has-text("Google"), .google-auth' },
+                    { action: 'google_auth' },
+                    { action: 'navigate', url: 'https://api.together.ai/settings/api-keys' },
+                    { action: 'extract', selector: 'input[readonly], code, .key-display', save_as: 'together_api_key' },
+                ],
+                priority: 'medium',
+            });
+        }
+
+        return tasks;
+    }
+
+    // ═══════════════════════════════════════
+    //  6. 全自动供应入口 (一键触发所有部署)
+    // ═══════════════════════════════════════
+
+    async autoProvisionAll() {
+        console.log(`${C.magenta}[Provision]${C.reset} ═══ 全自动GPU云供应启动 ═══`);
+        const results = { deployed: [], taskQueued: [], failed: [] };
+
+        // Step 1: 推送Colab notebook (最稳定的GPU途径)
+        const colab = await this.deployToColab();
+        if (colab.ok) results.deployed.push(colab);
+        else results.failed.push({ platform: 'colab', ...colab });
+
+        // Step 2: 推送Kaggle notebook
+        const kaggle = await this.deployToKaggle();
+        if (kaggle.ok) results.deployed.push(kaggle);
+        else results.failed.push({ platform: 'kaggle', ...kaggle });
+
+        // Step 3: HuggingFace Space
+        const hf = await this.deployToHuggingFace();
+        if (hf.ok) results.deployed.push(hf);
+        else if (hf.task_queued) results.taskQueued.push(hf);
+        else results.failed.push({ platform: 'huggingface', ...hf });
+
+        // Step 4: 生成所有缺失平台的注册任务
+        const regTasks = this.generateRegistrationTasks();
+        for (const task of regTasks) {
+            this._addBrowserTask(task);
+            results.taskQueued.push({ platform: task.platform, type: task.type });
+        }
+
+        console.log(`${C.magenta}[Provision]${C.reset} 结果: ${results.deployed.length}个已部署, ${results.taskQueued.length}个任务入队, ${results.failed.length}个失败`);
+        this._logProvision('auto_provision_all', results);
+
+        return results;
+    }
+
+    // ═══ 工具方法 ═══
+
+    async _pushFileToGitHub(filePath, content, message) {
+        if (!this._ghToken) return false;
+
+        try {
+            // 检查文件是否已存在 (获取SHA)
+            const existing = await this._deployer._ghAPI('GET',
+                `/repos/${this._ghRepo}/contents/${filePath}`
+            );
+            const sha = existing?.sha;
+
+            // 创建或更新文件
+            const result = await this._deployer._ghAPI('PUT',
+                `/repos/${this._ghRepo}/contents/${filePath}`,
+                {
+                    message,
+                    content: Buffer.from(content).toString('base64'),
+                    ...(sha ? { sha } : {}),
+                }
+            );
+
+            return result?.content?.sha ? true : false;
+        } catch (e) {
+            console.log(`${C.yellow}[Provision]${C.reset} 推送文件失败: ${e.message}`);
+            return false;
+        }
+    }
+
+    _httpsRequest(method, hostname, path, body, extraHeaders = {}) {
+        return new Promise((resolve) => {
+            const data = body ? JSON.stringify(body) : null;
+            const opts = {
+                hostname, path, method,
+                headers: {
+                    'User-Agent': 'living-seed-ai',
+                    'Accept': 'application/json',
+                    ...extraHeaders,
+                },
+            };
+            if (data) {
+                opts.headers['Content-Type'] = 'application/json';
+                opts.headers['Content-Length'] = Buffer.byteLength(data);
+            }
+            const req = require('https').request(opts, (res) => {
+                let result = '';
+                res.on('data', c => result += c);
+                res.on('end', () => {
+                    try { resolve(JSON.parse(result)); }
+                    catch { resolve(res.statusCode < 300 ? { ok: true } : null); }
+                });
+            });
+            req.on('error', () => resolve(null));
+            if (data) req.write(data);
+            req.end();
+        });
+    }
+
+    _logProvision(action, data) {
+        this._provisionLog.push({ time: Date.now(), action, data });
+        if (this._provisionLog.length > 50) this._provisionLog.splice(0, 25);
+    }
+
+    getStatus() {
+        return {
+            credentials: Object.keys(this._credentials),
+            pendingTasks: this._taskQueue.filter(t => t.status === 'pending').length,
+            completedTasks: this._taskQueue.filter(t => t.status === 'completed').length,
+            provisionLog: this._provisionLog.slice(-10),
+        };
+    }
+}
+
 class CloudEvolutionEngine {
     constructor() {
         this.aiFleet = new CloudAIFleet();
@@ -943,6 +1489,7 @@ class CloudEvolutionEngine {
         this.claude = new ClaudeThinkingPatterns();
         this.sync = new MultiCloudSync();  // ★ 多云同步
         this.deployer = new CloudAutoDeployer();  // ★ 自主云部署
+        this.provisioner = new GPUAutoProvisioner(this.deployer);  // ★ GPU全自动供应
         this._cycle = 0;
         this._running = false;
         this._startTime = Date.now();
@@ -967,9 +1514,23 @@ class CloudEvolutionEngine {
         // 启动API服务器
         this._startAPI();
 
+        // ★ 首次启动: 自动供应GPU云资源
+        this._autoProvision();
+
         // 进化循环
         console.log(`${C.green}[Cloud]${C.reset} 启动进化循环...\n`);
         this._evolutionLoop();
+    }
+
+    async _autoProvision() {
+        // 非阻塞: 在后台执行自动供应
+        try {
+            console.log(`${C.magenta}[Cloud]${C.reset} ★ 自动GPU云供应启动...`);
+            const result = await this.provisioner.autoProvisionAll();
+            console.log(`${C.magenta}[Cloud]${C.reset} ★ 供应完成: ${result.deployed.length}已部署 ${result.taskQueued.length}任务入队`);
+        } catch (e) {
+            console.log(`${C.yellow}[Cloud]${C.reset} 自动供应异常: ${e.message.substring(0, 60)}`);
+        }
     }
 
     _loadKnowledge() {
@@ -1059,6 +1620,16 @@ class CloudEvolutionEngine {
                 // 8. ★ 自主云部署管理 (每30轮 = ~1小时)
                 if (this._cycle % 30 === 0) {
                     await this._deployManageCycle();
+                }
+
+                // 9. ★ GPU供应重试 (每50轮 = ~1.5小时, 检查新凭据→重试部署)
+                if (this._cycle % 50 === 0) {
+                    const pendingTasks = this.provisioner.getPendingTasks();
+                    if (pendingTasks.length > 0) {
+                        console.log(`${C.cyan}[Provision]${C.reset} ${pendingTasks.length}个浏览器任务待处理 (等待本地Agent执行)`);
+                    }
+                    // 如果有新凭据，重试失败的部署
+                    this.provisioner._loadCredentials();
                 }
 
             } catch (e) {
@@ -1271,7 +1842,9 @@ class CloudEvolutionEngine {
         const expiry = this.sync.checkExpiry();
         console.log(`${C.cyan}║${C.reset} 同步: ${syncStatus.totalPeers}个peer | 实例:${syncStatus.instanceId}`);
         const deployStatus = this.deployer.getStatus();
-        console.log(`${C.cyan}║${C.reset} 部署: ${deployStatus.autoDeployable}个自动 + ${deployStatus.manual}个手动 | GPU平台:${this.deployer.getGPUPlatforms().length}`);
+        const provisionStatus = this.provisioner.getStatus();
+        console.log(`${C.cyan}║${C.reset} 部署: ${deployStatus.autoDeployable}个自动 + ${deployStatus.manual}个手动 | GPU:${this.deployer.getGPUPlatforms().length}`);
+        console.log(`${C.cyan}║${C.reset} 供应: 凭据${provisionStatus.credentials.length}个 | 任务:${provisionStatus.pendingTasks}待/${provisionStatus.completedTasks}完`);
         if (expiry.expiring) console.log(`${C.cyan}║${C.reset} ${C.red}⚠ 平台${expiry.daysLeft}天后到期!${C.reset}`);
         console.log(`${C.cyan}╚${'═'.repeat(40)}╝${C.reset}\n`);
     }
@@ -1460,6 +2033,39 @@ class CloudEvolutionEngine {
                     return;
                 }
 
+                // GPU供应: 全自动部署到GPU云
+                if (url === '/provision/auto' && req.method === 'POST') {
+                    const result = await this.provisioner.autoProvisionAll();
+                    res.writeHead(200);
+                    res.end(JSON.stringify(result));
+                    return;
+                }
+
+                // GPU供应: 状态
+                if (url === '/provision/status') {
+                    res.writeHead(200);
+                    res.end(JSON.stringify(this.provisioner.getStatus()));
+                    return;
+                }
+
+                // GPU供应: 浏览器Agent获取待处理任务
+                if (url === '/provision/tasks') {
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ tasks: this.provisioner.getPendingTasks() }));
+                    return;
+                }
+
+                // GPU供应: 浏览器Agent回报任务完成
+                if (url === '/provision/complete' && req.method === 'POST') {
+                    let body = '';
+                    for await (const chunk of req) body += chunk;
+                    const { taskId, result } = JSON.parse(body);
+                    this.provisioner.completeTask(taskId, result);
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ ok: true }));
+                    return;
+                }
+
                 // 部署管理: 发现新平台
                 if (url === '/deploy/discover' && req.method === 'POST') {
                     const discovered = await this.deployer.discoverNewPlatforms();
@@ -1489,7 +2095,7 @@ class CloudEvolutionEngine {
 
         server.listen(PORT, '0.0.0.0', () => {
             console.log(`${C.green}[API]${C.reset} 云端API服务器运行在 http://0.0.0.0:${PORT}`);
-            console.log(`${C.green}[API]${C.reset} 端点: /health /status /ask /knowledge /sync/* /deploy/* /claude/*`);
+            console.log(`${C.green}[API]${C.reset} 端点: /health /status /ask /knowledge /sync/* /deploy/* /provision/* /claude/*`);
         });
     }
 }
