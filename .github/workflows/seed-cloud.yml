@@ -1,0 +1,45 @@
+name: Living Seed AI - Cloud Brain
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Every 6 hours restart (GitHub Actions max 6h per job)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  seed-brain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # ~5.8 hours
+    env:
+      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      GITHUB_TOKEN_AI: ${{ secrets.GH_TOKEN_AI }}
+      SEED_INSTANCE_ID: github-actions
+      NODE_ENV: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --omit=dev 2>/dev/null || true
+
+      - name: Start Seed AI Cloud Brain
+        run: |
+          echo "Starting Living Seed AI Cloud Brain..."
+          timeout 21000 node start-cloud.js || echo "Session ended after ~5.8 hours"
+
+      - name: Save learned knowledge
+        if: always()
+        run: |
+          git config user.name "Seed AI Bot"
+          git config user.email "seed-ai@bot"
+          git add learned-from-network.json learned-knowledge.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Auto-save: learned knowledge $(date +%Y%m%d-%H%M)"
+          git push || true
