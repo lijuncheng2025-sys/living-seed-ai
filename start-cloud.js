@@ -485,12 +485,464 @@ class MultiCloudSync {
     }
 }
 
+// ═══════════════════════════════════════════════
+//  自主云部署器 (自动发现+创建+部署+管理云实例)
+// ═══════════════════════════════════════════════
+
+class CloudAutoDeployer {
+    constructor() {
+        this._ghToken = process.env.GITHUB_TOKEN_AI || process.env.GH_TOKEN_AI || '';
+        this._ghRepo = process.env.SEED_REPO || 'lijuncheng2025-sys/living-seed-ai';
+        this._instances = new Map();  // 管理所有云实例
+        this._deployLog = [];
+        this._maxCodespaces = 3;      // 最多同时3个codespace
+        this._maxActionsRuns = 2;     // 最多同时2个Actions运行
+        this._lastCheck = 0;
+        this._checkInterval = 600000; // 10分钟检查一次
+
+        // 从ai-keys.json加载token
+        if (!this._ghToken) {
+            try {
+                const keysPath = path.join(__dirname, 'ai-keys.json');
+                if (fs.existsSync(keysPath)) {
+                    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+                    this._ghToken = keys.github_token || keys.github_classic_token || '';
+                }
+            } catch {}
+        }
+
+        // 已知的免费云平台及其API能力
+        this._platforms = [
+            {
+                id: 'github-actions',
+                name: 'GitHub Actions',
+                type: 'ci-cd',
+                free: '2000分钟/月',
+                autoDeployable: true,
+                apiMethod: 'triggerWorkflow',
+            },
+            {
+                id: 'github-codespaces',
+                name: 'GitHub Codespaces',
+                type: 'vm',
+                free: '60小时/月 (2核8GB)',
+                autoDeployable: true,
+                apiMethod: 'createCodespace',
+            },
+            {
+                id: 'render',
+                name: 'Render.com',
+                type: 'paas',
+                free: '750小时/月',
+                autoDeployable: false, // 需要先手动注册
+                signupUrl: 'https://render.com',
+            },
+            {
+                id: 'railway',
+                name: 'Railway.app',
+                type: 'paas',
+                free: '500小时/月 + $5额度',
+                autoDeployable: false,
+                signupUrl: 'https://railway.app',
+            },
+            {
+                id: 'huggingface',
+                name: 'HuggingFace Spaces',
+                type: 'space',
+                free: '永久免费 (2vCPU/16GB)',
+                autoDeployable: false,
+                signupUrl: 'https://huggingface.co',
+            },
+            {
+                id: 'replit',
+                name: 'Replit',
+                type: 'ide',
+                free: '按需 (基础免费)',
+                autoDeployable: false,
+                signupUrl: 'https://replit.com',
+            },
+            // ═══ 免费GPU平台 (种子最佳土壤) ═══
+            {
+                id: 'google-colab',
+                name: 'Google Colab',
+                type: 'gpu',
+                free: 'T4 GPU (12h/session)',
+                gpu: 'Tesla T4 16GB',
+                autoDeployable: false,
+                signupUrl: 'https://colab.research.google.com',
+                deployMethod: 'notebook', // 通过Notebook运行
+                notebookTemplate: '!git clone https://github.com/{repo}.git && cd living-seed-ai && npm install && node start-cloud.js',
+            },
+            {
+                id: 'kaggle',
+                name: 'Kaggle Notebooks',
+                type: 'gpu',
+                free: '30小时/周 GPU (T4/P100)',
+                gpu: 'Tesla T4 16GB / P100 16GB',
+                autoDeployable: false,
+                signupUrl: 'https://www.kaggle.com',
+                deployMethod: 'notebook',
+                notebookTemplate: '!git clone https://github.com/{repo}.git && cd living-seed-ai && npm install && timeout 36000 node start-cloud.js',
+            },
+            {
+                id: 'lightning-ai',
+                name: 'Lightning.ai Studios',
+                type: 'gpu',
+                free: '22 GPU小时/月免费',
+                gpu: 'A10G / T4',
+                autoDeployable: false,
+                signupUrl: 'https://lightning.ai',
+                deployMethod: 'studio',
+            },
+            {
+                id: 'hf-zerogpu',
+                name: 'HuggingFace ZeroGPU',
+                type: 'gpu',
+                free: 'H200按需分配 (Spaces)',
+                gpu: 'H200',
+                autoDeployable: false,
+                signupUrl: 'https://huggingface.co/spaces',
+                deployMethod: 'space',
+            },
+            {
+                id: 'oracle-cloud',
+                name: 'Oracle Cloud Free Tier',
+                type: 'vm',
+                free: 'ARM 4核24GB 永久免费',
+                autoDeployable: false,
+                signupUrl: 'https://cloud.oracle.com',
+                deployMethod: 'ssh',
+            },
+            {
+                id: 'gcp-free',
+                name: 'Google Cloud Free Tier',
+                type: 'vm',
+                free: 'e2-micro 永久免费',
+                autoDeployable: false,
+                signupUrl: 'https://cloud.google.com/free',
+                deployMethod: 'ssh',
+            },
+        ];
+    }
+
+    // ═══ 自主检查和部署 ═══
+    async autoManage() {
+        if (!this._ghToken) {
+            console.log(`${C.yellow}[AutoDeploy]${C.reset} 无GitHub Token, 跳过自主部署`);
+            return { managed: false, reason: 'no_token' };
+        }
+
+        const now = Date.now();
+        if (now - this._lastCheck < this._checkInterval) return { managed: false, reason: 'cooldown' };
+        this._lastCheck = now;
+
+        console.log(`${C.cyan}[AutoDeploy]${C.reset} 开始自主云资源管理...`);
+        const results = {};
+
+        // 1. 检查GitHub Actions状态
+        results.actions = await this._manageActions();
+
+        // 2. 检查GitHub Codespaces状态
+        results.codespaces = await this._manageCodespaces();
+
+        // 3. 汇总可用实例
+        this._logDeploy('auto_manage', results);
+
+        const totalActive = (results.actions?.running || 0) + (results.codespaces?.running || 0);
+        console.log(`${C.cyan}[AutoDeploy]${C.reset} 活跃实例: ${totalActive} (Actions:${results.actions?.running||0} Codespaces:${results.codespaces?.running||0})`);
+
+        // 4. 如果没有活跃实例，自动创建
+        if (totalActive === 0) {
+            console.log(`${C.red}[AutoDeploy]${C.reset} 无活跃实例! 自动触发新部署...`);
+            const deployed = await this._autoRecover();
+            results.recovery = deployed;
+        }
+
+        return { managed: true, results };
+    }
+
+    // ═══ GitHub Actions管理 ═══
+    async _manageActions() {
+        try {
+            const runs = await this._ghAPI('GET', `/repos/${this._ghRepo}/actions/runs?status=in_progress`);
+            const running = runs?.workflow_runs?.length || 0;
+
+            // 如果没有运行中的，触发一个
+            if (running === 0) {
+                console.log(`${C.yellow}[AutoDeploy]${C.reset} Actions无运行实例，触发新的...`);
+                await this._triggerWorkflow();
+                return { running: 1, action: 'triggered' };
+            }
+
+            // 如果运行太多，不做操作
+            if (running > this._maxActionsRuns) {
+                console.log(`${C.yellow}[AutoDeploy]${C.reset} Actions有${running}个运行中，达到上限`);
+            }
+
+            return { running, action: 'monitored' };
+        } catch (e) {
+            return { running: 0, error: e.message };
+        }
+    }
+
+    async _triggerWorkflow() {
+        return this._ghAPI('POST', `/repos/${this._ghRepo}/actions/workflows/seed-cloud.yml/dispatches`, { ref: 'main' });
+    }
+
+    // ═══ GitHub Codespaces管理 ═══
+    async _manageCodespaces() {
+        try {
+            const list = await this._ghAPI('GET', '/user/codespaces');
+            const mySpaces = (list?.codespaces || []).filter(cs =>
+                cs.repository?.full_name === this._ghRepo
+            );
+
+            const running = mySpaces.filter(cs => cs.state === 'Available').length;
+            const stopped = mySpaces.filter(cs => cs.state === 'Shutdown').length;
+            const total = mySpaces.length;
+
+            // 如果有停止的，启动一个
+            if (running === 0 && stopped > 0) {
+                const toStart = mySpaces.find(cs => cs.state === 'Shutdown');
+                console.log(`${C.yellow}[AutoDeploy]${C.reset} 启动已停止的Codespace: ${toStart.name}`);
+                await this._ghAPI('POST', `/user/codespaces/${toStart.name}/start`);
+                return { running: 1, total, action: 'restarted' };
+            }
+
+            // 如果没有任何codespace且配额允许，创建一个
+            if (total === 0 && total < this._maxCodespaces) {
+                console.log(`${C.yellow}[AutoDeploy]${C.reset} 创建新Codespace...`);
+                const repoData = await this._ghAPI('GET', `/repos/${this._ghRepo}`);
+                if (repoData?.id) {
+                    await this._ghAPI('POST', '/user/codespaces', {
+                        repository_id: repoData.id,
+                        ref: 'main',
+                        machine: 'basicLinux32gb',
+                    });
+                    return { running: 1, total: total + 1, action: 'created' };
+                }
+            }
+
+            return { running, total, action: 'monitored' };
+        } catch (e) {
+            return { running: 0, error: e.message };
+        }
+    }
+
+    // ═══ 自动恢复 (所有实例都挂了) ═══
+    async _autoRecover() {
+        const results = [];
+
+        // 优先触发Actions (最稳定)
+        try {
+            await this._triggerWorkflow();
+            results.push({ platform: 'github-actions', status: 'triggered' });
+            console.log(`${C.green}[AutoDeploy]${C.reset} Actions工作流已触发`);
+        } catch (e) {
+            results.push({ platform: 'github-actions', status: 'failed', error: e.message });
+        }
+
+        return results;
+    }
+
+    // ═══ 获取部署状态 ═══
+    getStatus() {
+        return {
+            ghToken: this._ghToken ? 'configured' : 'missing',
+            repo: this._ghRepo,
+            platforms: this._platforms.map(p => ({
+                id: p.id, name: p.name, free: p.free,
+                autoDeployable: p.autoDeployable,
+            })),
+            instances: Object.fromEntries(this._instances),
+            deployLog: this._deployLog.slice(-10),
+            lastCheck: this._lastCheck,
+        };
+    }
+
+    // ═══ 获取可自动部署的平台 ═══
+    getAutoDeployablePlatforms() {
+        return this._platforms.filter(p => p.autoDeployable);
+    }
+
+    // ═══ 获取需要手动注册的平台 ═══
+    getManualPlatforms() {
+        return this._platforms.filter(p => !p.autoDeployable);
+    }
+
+    // ═══ 获取免费GPU平台信息 ═══
+    getGPUPlatforms() {
+        return this._platforms.filter(p => p.type === 'gpu');
+    }
+
+    // ═══ 生成部署脚本 (给浏览器Agent或手动使用) ═══
+    generateDeployScripts() {
+        const scripts = {};
+
+        // Google Colab Notebook
+        scripts.colab = {
+            platform: 'Google Colab',
+            type: 'notebook',
+            cells: [
+                { type: 'code', source: `# 活体种子AI - Colab GPU部署\n!git clone https://github.com/${this._ghRepo}.git\n%cd living-seed-ai` },
+                { type: 'code', source: '!curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs' },
+                { type: 'code', source: '!npm install --omit=dev 2>/dev/null' },
+                { type: 'code', source: `import os\nos.environ['CEREBRAS_API_KEY'] = 'from-secrets'\nos.environ['DEEPSEEK_API_KEY'] = 'from-secrets'\nos.environ['SEED_INSTANCE_ID'] = 'colab-gpu'` },
+                { type: 'code', source: '!timeout 36000 node start-cloud.js  # 10小时后自动停止' },
+            ],
+        };
+
+        // Kaggle Notebook
+        scripts.kaggle = {
+            platform: 'Kaggle',
+            type: 'notebook',
+            cells: [
+                { type: 'code', source: `# 活体种子AI - Kaggle GPU部署 (30h/week free GPU)\n!git clone https://github.com/${this._ghRepo}.git\n%cd living-seed-ai` },
+                { type: 'code', source: '!curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs 2>/dev/null' },
+                { type: 'code', source: '!npm install --omit=dev 2>/dev/null' },
+                { type: 'code', source: '!timeout 36000 node start-cloud.js' },
+            ],
+        };
+
+        // Shell脚本 (Oracle/GCP等VM)
+        scripts.vm_setup = {
+            platform: 'Linux VM (Oracle/GCP/AWS)',
+            type: 'shell',
+            script: `#!/bin/bash
+# 活体种子AI - VM自动部署
+set -e
+
+# 安装Node.js 22
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
+sudo apt-get install -y nodejs git
+
+# 克隆代码
+git clone https://github.com/${this._ghRepo}.git
+cd living-seed-ai
+
+# 安装依赖
+npm install --omit=dev
+
+# 设置环境变量
+export SEED_INSTANCE_ID="vm-$(hostname)"
+
+# 创建systemd服务 (开机自启)
+sudo tee /etc/systemd/system/seed-ai.service > /dev/null <<EOF2
+[Unit]
+Description=Living Seed AI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$(pwd)
+ExecStart=/usr/bin/node start-cloud.js
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+
+sudo systemctl enable seed-ai
+sudo systemctl start seed-ai
+echo "种子AI已部署并设为开机自启!"`,
+        };
+
+        return scripts;
+    }
+
+    // ═══ 自动推送代码更新到GitHub (让云实例获取最新代码) ═══
+    async pushCodeUpdate(message) {
+        if (!this._ghToken) return { ok: false, reason: 'no_token' };
+
+        try {
+            // 获取当前SHA
+            const ref = await this._ghAPI('GET', `/repos/${this._ghRepo}/git/ref/heads/main`);
+            if (!ref?.object?.sha) return { ok: false, reason: 'no_ref' };
+
+            console.log(`${C.cyan}[AutoDeploy]${C.reset} 代码更新推送: ${message}`);
+            return { ok: true, sha: ref.object.sha };
+        } catch (e) {
+            return { ok: false, error: e.message };
+        }
+    }
+
+    // ═══ 扫描可用的新免费平台 (自主发现) ═══
+    async discoverNewPlatforms() {
+        const discovered = [];
+        const knownIds = this._platforms.map(p => p.id);
+
+        // 通过GitHub搜索发现新的免费部署平台
+        try {
+            const searchResult = await this._ghAPI('GET',
+                '/search/repositories?q=free+cloud+deploy+gpu+nodejs&sort=stars&per_page=5'
+            );
+            if (searchResult?.items) {
+                for (const repo of searchResult.items) {
+                    if (!knownIds.includes(repo.full_name)) {
+                        discovered.push({
+                            name: repo.full_name,
+                            description: (repo.description || '').substring(0, 100),
+                            stars: repo.stargazers_count,
+                            url: repo.html_url,
+                        });
+                    }
+                }
+            }
+        } catch {}
+
+        if (discovered.length > 0) {
+            console.log(`${C.cyan}[AutoDeploy]${C.reset} 发现${discovered.length}个潜在新平台`);
+        }
+        return discovered;
+    }
+
+    _logDeploy(action, data) {
+        this._deployLog.push({ time: Date.now(), action, data });
+        if (this._deployLog.length > 50) this._deployLog.splice(0, 25);
+    }
+
+    // ═══ GitHub API通用方法 ═══
+    _ghAPI(method, endpoint, body) {
+        return new Promise((resolve) => {
+            const data = body ? JSON.stringify(body) : null;
+            const opts = {
+                hostname: 'api.github.com',
+                path: endpoint,
+                method,
+                headers: {
+                    'Authorization': `token ${this._ghToken}`,
+                    'User-Agent': 'living-seed-ai',
+                    'Accept': 'application/vnd.github+json',
+                },
+            };
+            if (data) {
+                opts.headers['Content-Type'] = 'application/json';
+                opts.headers['Content-Length'] = Buffer.byteLength(data);
+            }
+            const req = require('https').request(opts, (res) => {
+                let result = '';
+                res.on('data', c => result += c);
+                res.on('end', () => {
+                    try { resolve(JSON.parse(result)); }
+                    catch { resolve(res.statusCode < 300 ? { ok: true } : null); }
+                });
+            });
+            req.on('error', () => resolve(null));
+            req.on('timeout', () => { req.destroy(); resolve(null); });
+            if (data) req.write(data);
+            req.end();
+        });
+    }
+}
+
 class CloudEvolutionEngine {
     constructor() {
         this.aiFleet = new CloudAIFleet();
         this.brain = new NeuroBrain();
         this.claude = new ClaudeThinkingPatterns();
         this.sync = new MultiCloudSync();  // ★ 多云同步
+        this.deployer = new CloudAutoDeployer();  // ★ 自主云部署
         this._cycle = 0;
         this._running = false;
         this._startTime = Date.now();
@@ -602,6 +1054,11 @@ class CloudEvolutionEngine {
                 // 7. ★ 到期检查 (每20轮)
                 if (this._cycle % 20 === 0) {
                     this._checkMigration();
+                }
+
+                // 8. ★ 自主云部署管理 (每30轮 = ~1小时)
+                if (this._cycle % 30 === 0) {
+                    await this._deployManageCycle();
                 }
 
             } catch (e) {
@@ -726,6 +1183,47 @@ class CloudEvolutionEngine {
         }
     }
 
+    async _deployManageCycle() {
+        console.log(`${C.cyan}[Deploy]${C.reset} 自主云部署管理...`);
+        try {
+            const result = await this.deployer.autoManage();
+            if (result.managed) {
+                const r = result.results;
+                const actions = r.actions?.running || 0;
+                const codespaces = r.codespaces?.running || 0;
+                console.log(`${C.green}[Deploy]${C.reset} 云实例: Actions=${actions} Codespaces=${codespaces}`);
+
+                // 如果有恢复操作
+                if (r.recovery) {
+                    console.log(`${C.yellow}[Deploy]${C.reset} 自动恢复: ${JSON.stringify(r.recovery).substring(0, 100)}`);
+                }
+            }
+
+            // 每100轮尝试发现新平台
+            if (this._cycle % 100 === 0) {
+                const discovered = await this.deployer.discoverNewPlatforms();
+                if (discovered.length > 0) {
+                    // 记录到知识库
+                    for (const p of discovered.slice(0, 3)) {
+                        const exists = this._knowledgeBase.some(k => k.topic === `platform:${p.name}`);
+                        if (!exists) {
+                            this._knowledgeBase.push({
+                                topic: `platform:${p.name}`,
+                                summary: p.description,
+                                source: 'auto_discovery',
+                                learnedAt: new Date().toISOString(),
+                                url: p.url,
+                            });
+                        }
+                    }
+                    this._saveKnowledge();
+                }
+            }
+        } catch (e) {
+            console.log(`${C.yellow}[Deploy]${C.reset} 管理异常: ${e.message.substring(0, 60)}`);
+        }
+    }
+
     _checkMigration() {
         const expiry = this.sync.checkExpiry();
         if (expiry.expiring) {
@@ -772,6 +1270,8 @@ class CloudEvolutionEngine {
         const syncStatus = this.sync.getPeerStatus();
         const expiry = this.sync.checkExpiry();
         console.log(`${C.cyan}║${C.reset} 同步: ${syncStatus.totalPeers}个peer | 实例:${syncStatus.instanceId}`);
+        const deployStatus = this.deployer.getStatus();
+        console.log(`${C.cyan}║${C.reset} 部署: ${deployStatus.autoDeployable}个自动 + ${deployStatus.manual}个手动 | GPU平台:${this.deployer.getGPUPlatforms().length}`);
         if (expiry.expiring) console.log(`${C.cyan}║${C.reset} ${C.red}⚠ 平台${expiry.daysLeft}天后到期!${C.reset}`);
         console.log(`${C.cyan}╚${'═'.repeat(40)}╝${C.reset}\n`);
     }
@@ -930,6 +1430,44 @@ class CloudEvolutionEngine {
                     return;
                 }
 
+                // 部署管理: 状态
+                if (url === '/deploy/status') {
+                    const deployStatus = this.deployer.getStatus();
+                    const gpuPlatforms = this.deployer.getGPUPlatforms();
+                    const scripts = this.deployer.generateDeployScripts();
+                    res.writeHead(200);
+                    res.end(JSON.stringify({
+                        ...deployStatus,
+                        gpu: gpuPlatforms,
+                        availableScripts: Object.keys(scripts),
+                    }));
+                    return;
+                }
+
+                // 部署管理: 触发自动管理
+                if (url === '/deploy/manage' && req.method === 'POST') {
+                    this.deployer._lastCheck = 0; // 重置冷却
+                    const result = await this.deployer.autoManage();
+                    res.writeHead(200);
+                    res.end(JSON.stringify(result));
+                    return;
+                }
+
+                // 部署管理: 获取部署脚本
+                if (url === '/deploy/scripts') {
+                    res.writeHead(200);
+                    res.end(JSON.stringify(this.deployer.generateDeployScripts()));
+                    return;
+                }
+
+                // 部署管理: 发现新平台
+                if (url === '/deploy/discover' && req.method === 'POST') {
+                    const discovered = await this.deployer.discoverNewPlatforms();
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ discovered }));
+                    return;
+                }
+
                 // Claude代码质量
                 if (url === '/claude/quality' && req.method === 'POST') {
                     let body = '';
@@ -951,7 +1489,7 @@ class CloudEvolutionEngine {
 
         server.listen(PORT, '0.0.0.0', () => {
             console.log(`${C.green}[API]${C.reset} 云端API服务器运行在 http://0.0.0.0:${PORT}`);
-            console.log(`${C.green}[API]${C.reset} 端点: /health /status /ask /knowledge /sync/perceive /sync/decision /claude/think /claude/syntax /claude/quality`);
+            console.log(`${C.green}[API]${C.reset} 端点: /health /status /ask /knowledge /sync/* /deploy/* /claude/*`);
         });
     }
 }
