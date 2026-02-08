@@ -1,0 +1,32 @@
+# 活体种子AI - 云端轻量版 (HuggingFace Spaces / Render / Railway)
+# 只运行大脑+进化+学习 (不含眼/手/浏览器)
+# 端口: 7860 (HuggingFace默认)
+
+FROM node:22-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY package.json ./
+RUN npm install --omit=dev --ignore-scripts --no-optional 2>/dev/null; exit 0
+
+# 只复制云端需要的核心文件
+COPY seed-neuro-brain.js seed-living-core.js seed-global-evolution.js \
+     seed-llm-evolution.js seed-auto-repair.js seed-auto-learner.js \
+     seed-ast-engine.js seed-smart-search.js start-cloud.js ./
+
+# 数据文件 (knowledge bases)
+COPY open-knowledge-base.json learned-knowledge.json \
+     learned-from-network.json ai-keys.json ./  2>/dev/null; true
+
+ENV PORT=7860
+ENV NODE_ENV=production
+EXPOSE 7860
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:7860/health || exit 1
+
+CMD ["node", "start-cloud.js"]

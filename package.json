@@ -1,0 +1,19 @@
+{
+  "name": "living-seed-ai",
+  "version": "8.0.0",
+  "description": "Living Seed AI - Self-evolving AI with neural brain, Claude thinking patterns, and multi-cloud sync",
+  "main": "start-cloud.js",
+  "scripts": {
+    "start": "node start-cloud.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.4",
+    "cheerio": "^1.0.0",
+    "acorn": "^8.15.0",
+    "escodegen": "^2.1.0",
+    "estraverse": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
